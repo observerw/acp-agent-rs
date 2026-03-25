@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::ExitStatus;
 
+use crate::runtime::serve::ServeTransport;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
@@ -9,12 +10,13 @@ pub mod install_env;
 pub mod list;
 pub mod run;
 pub mod search;
+pub mod serve;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "acp-agent",
     version,
-    about = "Install, discover, and run ACP agents from the public registry."
+    about = "Install, discover, run, and serve ACP agents from the public registry."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -34,19 +36,29 @@ enum Commands {
     Install {
         agent_id: String,
     },
-    #[command(trailing_var_arg = true)]
+    #[command(about = "Run an ACP agent over stdio.")]
     Run {
+        agent_id: String,
+        #[arg(help = "Arguments passed through to the agent process.")]
+        args: Vec<String>,
+    },
+    #[command(
+        about = "Serve an ACP agent over a network transport.",
+        trailing_var_arg = true
+    )]
+    Serve {
         agent_id: String,
         #[arg(
             long,
-            default_value = "stdio",
-            help = "stdio, single-session HTTP/2 byte stream, or jsonrpsee WebSocket bridge"
+            default_value = "http",
+            help = "Network transport to expose (http or ws)."
         )]
-        transport: run::RunTransport,
+        transport: ServeTransport,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 0)]
         port: u16,
+        #[arg(help = "Arguments passed through to the agent process.")]
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -85,24 +97,22 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             writeln!(writer, "{outcome}")?;
             Ok(CliExit::Success)
         }
-        Commands::Run {
+        Commands::Run { agent_id, args } => {
+            let status = run::run_agent(&agent_id, &args)
+                .await
+                .with_context(|| format!("failed to run agent \"{agent_id}\""))?;
+            Ok(exit_from_status(status))
+        }
+        Commands::Serve {
             agent_id,
             transport,
             host,
             port,
             args,
         } => {
-            let status = run::run_agent(
-                &agent_id,
-                run::RunOptions {
-                    transport,
-                    host,
-                    port,
-                },
-                &args,
-            )
-            .await
-            .with_context(|| format!("failed to run agent \"{agent_id}\""))?;
+            let status = serve::serve_agent(&agent_id, transport, host, port, &args)
+                .await
+                .with_context(|| format!("failed to serve agent \"{agent_id}\""))?;
             Ok(exit_from_status(status))
         }
     }
@@ -135,6 +145,7 @@ fn signal_exit_code(_: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn parses_install_subcommand() {
@@ -187,22 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_subcommand_with_default_stdio_transport() {
+    fn parses_run_subcommand_with_model_args() {
         let cli = Cli::try_parse_from(["acp-agent", "run", "demo-agent", "--", "--model", "gpt-5"])
             .unwrap();
 
         match cli.command {
-            Commands::Run {
-                agent_id,
-                transport,
-                host,
-                port,
-                args,
-            } => {
+            Commands::Run { agent_id, args } => {
                 assert_eq!(agent_id, "demo-agent");
-                assert_eq!(transport, run::RunTransport::Stdio);
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 0);
                 assert_eq!(args, vec!["--model", "gpt-5"]);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -210,100 +212,69 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_subcommand_with_explicit_stdio_transport() {
-        let cli = Cli::try_parse_from([
-            "acp-agent",
-            "run",
-            "demo-agent",
-            "--transport",
-            "stdio",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8080",
-        ])
-        .unwrap();
+    fn parses_serve_subcommand_with_defaults() {
+        let cli = Cli::try_parse_from(["acp-agent", "serve", "demo-agent"]).unwrap();
 
         match cli.command {
-            Commands::Run {
+            Commands::Serve {
+                agent_id,
                 transport,
                 host,
                 port,
-                ..
+                args,
             } => {
-                assert_eq!(transport, run::RunTransport::Stdio);
-                assert_eq!(host, "0.0.0.0");
-                assert_eq!(port, 8080);
-            }
-            command => panic!("unexpected command: {command:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_run_subcommand_with_http_transport() {
-        let cli = Cli::try_parse_from([
-            "acp-agent",
-            "run",
-            "demo-agent",
-            "--transport",
-            "http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9000",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Run {
-                transport,
-                host,
-                port,
-                ..
-            } => {
-                assert_eq!(transport, run::RunTransport::Http);
+                assert_eq!(agent_id, "demo-agent");
+                assert_eq!(transport, ServeTransport::Http);
                 assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 9000);
+                assert_eq!(port, 0);
+                assert!(args.is_empty());
             }
             command => panic!("unexpected command: {command:?}"),
         }
     }
 
     #[test]
-    fn parses_run_subcommand_with_ws_transport() {
+    fn parses_serve_subcommand_with_explicit_options() {
         let cli = Cli::try_parse_from([
             "acp-agent",
-            "run",
+            "serve",
             "demo-agent",
             "--transport",
             "ws",
             "--host",
-            "127.0.0.1",
+            "0.0.0.0",
             "--port",
-            "9010",
+            "8010",
+            "--",
+            "--model",
+            "gpt-6",
         ])
         .unwrap();
 
         match cli.command {
-            Commands::Run {
+            Commands::Serve {
                 transport,
                 host,
                 port,
+                args,
                 ..
             } => {
-                assert_eq!(transport, run::RunTransport::Ws);
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 9010);
+                assert_eq!(transport, ServeTransport::Ws);
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(port, 8010);
+                assert_eq!(args, vec!["--model", "gpt-6"]);
             }
             command => panic!("unexpected command: {command:?}"),
         }
     }
 
     #[test]
-    fn rejects_archived_serve_subcommand() {
-        let error = Cli::try_parse_from(["acp-agent", "serve", "demo-agent"]).unwrap_err();
+    fn rejects_serve_subcommand_with_stdio_transport() {
+        let error =
+            Cli::try_parse_from(["acp-agent", "serve", "demo-agent", "--transport", "stdio"])
+                .unwrap_err();
 
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]
