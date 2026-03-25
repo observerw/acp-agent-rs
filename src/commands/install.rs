@@ -1,10 +1,9 @@
-use std::error::Error;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use anyhow::{Context, Result, anyhow, bail};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use tokio::fs;
@@ -13,17 +12,13 @@ use tokio::task;
 use zip::ZipArchive;
 
 use crate::registry::{
-    AgentNotFoundError, BinaryTarget, FetchRegistryError, NpxDistribution, Platform, Registry,
-    RegistryAgent, UnsupportedPlatformError, UvxDistribution, fetch_registry,
+    BinaryTarget, NpxDistribution, Platform, Registry, RegistryAgent, UvxDistribution,
+    fetch_registry,
 };
 
-pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome, InstallError> {
-    let registry = fetch_registry()
-        .await
-        .map_err(InstallError::FetchRegistry)?;
-    let agent = registry
-        .get_agent(agent_id)
-        .map_err(InstallError::AgentNotFound)?;
+pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
+    let registry = fetch_registry().await?;
+    let agent = registry.get_agent(agent_id)?;
 
     install_from_registry(&registry, agent).await
 }
@@ -31,9 +26,9 @@ pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome, InstallErro
 pub async fn install_from_registry(
     _registry: &Registry,
     agent: &RegistryAgent,
-) -> Result<InstallOutcome, InstallError> {
+) -> Result<InstallOutcome> {
     if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current().map_err(InstallError::UnsupportedPlatform)?;
+        let platform = Platform::current()?;
         if let Some(target) = binary.for_platform(platform) {
             return install_binary(agent, target).await;
         }
@@ -47,15 +42,16 @@ pub async fn install_from_registry(
         return install_uvx(agent, uvx).await;
     }
 
-    Err(InstallError::UnavailableDistribution {
-        agent_id: agent.id.clone(),
-    })
+    Err(anyhow!(
+        "agent \"{}\" does not have an installable distribution",
+        agent.id
+    ))
 }
 
 async fn install_npx(
     agent: &RegistryAgent,
     distribution: &NpxDistribution,
-) -> Result<InstallOutcome, InstallError> {
+) -> Result<InstallOutcome> {
     run_command(
         "npm",
         ["i", "-g", distribution.package.as_str()],
@@ -73,7 +69,7 @@ async fn install_npx(
 async fn install_uvx(
     agent: &RegistryAgent,
     distribution: &UvxDistribution,
-) -> Result<InstallOutcome, InstallError> {
+) -> Result<InstallOutcome> {
     run_command(
         "uv",
         ["tool", "install", distribution.package.as_str()],
@@ -88,19 +84,16 @@ async fn install_uvx(
     })
 }
 
-async fn install_binary(
-    agent: &RegistryAgent,
-    target: &BinaryTarget,
-) -> Result<InstallOutcome, InstallError> {
+async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<InstallOutcome> {
     let temp_dir = task::spawn_blocking(tempfile::tempdir)
         .await
-        .map_err(InstallError::Join)?
-        .map_err(InstallError::Io)?;
+        .context("blocking task failed while creating temporary directory")?
+        .context("failed to create temporary directory")?;
     let archive_path = download_archive(target, temp_dir.path()).await?;
     let extracted_dir = temp_dir.path().join("extracted");
     fs::create_dir_all(&extracted_dir)
         .await
-        .map_err(InstallError::Io)?;
+        .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
     extract_archive(archive_path, extracted_dir.clone()).await?;
 
     let source_path = resolve_cmd_path(&extracted_dir, &target.cmd);
@@ -110,27 +103,32 @@ async fn install_binary(
         .map(|metadata| !metadata.is_file())
         .unwrap_or(true)
     {
-        return Err(InstallError::BinaryNotFound {
-            archive: target.archive.clone(),
-            cmd: target.cmd.clone(),
-            resolved_path: source_path,
-        });
+        bail!(
+            "downloaded {}, but could not find \"{}\" at {}",
+            target.archive,
+            target.cmd,
+            source_path.display()
+        );
     }
 
     let install_dir = user_install_dir()?;
     fs::create_dir_all(&install_dir)
         .await
-        .map_err(InstallError::Io)?;
+        .with_context(|| format!("failed to create {}", install_dir.display()))?;
     let file_name = source_path
         .file_name()
-        .ok_or_else(|| InstallError::InvalidCommandPath(target.cmd.clone()))?;
+        .ok_or_else(|| anyhow!("invalid binary command path: {}", target.cmd))?;
     let destination = install_dir.join(file_name);
     fs::copy(&source_path, &destination)
         .await
-        .map_err(InstallError::Io)?;
-    make_executable(&destination)
-        .await
-        .map_err(InstallError::Io)?;
+        .with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source_path.display(),
+                destination.display()
+            )
+        })?;
+    make_executable(&destination).await?;
 
     Ok(InstallOutcome::Binary {
         agent_id: agent.id.clone(),
@@ -138,12 +136,9 @@ async fn install_binary(
     })
 }
 
-pub(crate) async fn download_archive(
-    target: &BinaryTarget,
-    temp_dir: &Path,
-) -> Result<PathBuf, InstallError> {
+pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> Result<PathBuf> {
     let url = reqwest::Url::parse(&target.archive)
-        .map_err(|_| InstallError::InvalidArchiveUrl(target.archive.clone()))?;
+        .with_context(|| format!("invalid archive URL: {}", target.archive))?;
     let archive_name = url
         .path_segments()
         .and_then(|mut segments| segments.next_back())
@@ -151,25 +146,34 @@ pub(crate) async fn download_archive(
         .unwrap_or("download.bin");
     let destination = temp_dir.join(archive_name);
 
-    let response = reqwest::get(url).await.map_err(InstallError::Request)?;
-    let response = response.error_for_status().map_err(InstallError::Request)?;
-    let bytes = response.bytes().await.map_err(InstallError::Request)?;
+    let response = reqwest::get(url)
+        .await
+        .with_context(|| format!("failed to download archive from {}", target.archive))?;
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("failed to download archive from {}", target.archive))?;
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read archive response from {}", target.archive))?;
     fs::write(&destination, bytes.as_ref())
         .await
-        .map_err(InstallError::Io)?;
+        .with_context(|| {
+            format!(
+                "failed to write downloaded archive to {}",
+                destination.display()
+            )
+        })?;
     Ok(destination)
 }
 
-pub(crate) async fn extract_archive(
-    archive_path: PathBuf,
-    destination: PathBuf,
-) -> Result<(), InstallError> {
+pub(crate) async fn extract_archive(archive_path: PathBuf, destination: PathBuf) -> Result<()> {
     task::spawn_blocking(move || extract_archive_blocking(&archive_path, &destination))
         .await
-        .map_err(InstallError::Join)?
+        .context("blocking task failed while extracting archive")?
 }
 
-fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<(), InstallError> {
+fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<()> {
     let file_name = archive_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -181,50 +185,71 @@ fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<(
     }
 
     if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
-        let file = File::open(archive_path).map_err(InstallError::Io)?;
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut archive = tar::Archive::new(decoder);
-        archive.unpack(destination).map_err(InstallError::Io)?;
+        archive
+            .unpack(destination)
+            .with_context(|| format!("failed to unpack archive into {}", destination.display()))?;
         return Ok(());
     }
 
     if file_name.ends_with(".tar.bz2") || file_name.ends_with(".tbz2") {
-        let file = File::open(archive_path).map_err(InstallError::Io)?;
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
         let decoder = BzDecoder::new(file);
         let mut archive = tar::Archive::new(decoder);
-        archive.unpack(destination).map_err(InstallError::Io)?;
+        archive
+            .unpack(destination)
+            .with_context(|| format!("failed to unpack archive into {}", destination.display()))?;
         return Ok(());
     }
 
-    let fallback_path = destination.join(archive_path.file_name().ok_or_else(|| {
-        InstallError::UnsupportedArchiveFormat(archive_path.display().to_string())
-    })?);
-    std::fs::copy(archive_path, fallback_path).map_err(InstallError::Io)?;
+    let file_name = archive_path
+        .file_name()
+        .ok_or_else(|| anyhow!("unsupported archive format for {}", archive_path.display()))?;
+    let fallback_path = destination.join(file_name);
+    std::fs::copy(archive_path, &fallback_path).with_context(|| {
+        format!(
+            "failed to copy archive {} to {}",
+            archive_path.display(),
+            fallback_path.display()
+        )
+    })?;
     Ok(())
 }
 
-fn extract_zip(archive_path: &Path, destination: &Path) -> Result<(), InstallError> {
-    let file = File::open(archive_path).map_err(InstallError::Io)?;
-    let mut archive = ZipArchive::new(file).map_err(InstallError::Zip)?;
+fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("failed to read ZIP archive {}", archive_path.display()))?;
 
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(InstallError::Zip)?;
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("failed to read ZIP entry {index}"))?;
         let enclosed = entry
             .enclosed_name()
-            .ok_or_else(|| InstallError::UnsafeArchiveEntry(entry.name().to_string()))?;
+            .ok_or_else(|| anyhow!("archive contains unsafe path: {}", entry.name()))?;
         let output_path = destination.join(enclosed);
 
         if entry.name().ends_with('/') {
-            std::fs::create_dir_all(&output_path).map_err(InstallError::Io)?;
+            std::fs::create_dir_all(&output_path)
+                .with_context(|| format!("failed to create {}", output_path.display()))?;
             continue;
         }
 
         if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent).map_err(InstallError::Io)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let mut output = File::create(&output_path).map_err(InstallError::Io)?;
-        io::copy(&mut entry, &mut output).map_err(InstallError::Io)?;
+        let mut output = File::create(&output_path)
+            .with_context(|| format!("failed to create {}", output_path.display()))?;
+        io::copy(&mut entry, &mut output)
+            .with_context(|| format!("failed to extract {}", output_path.display()))?;
     }
 
     Ok(())
@@ -247,16 +272,18 @@ pub(crate) fn resolve_cmd_path(extracted_dir: &Path, cmd: &str) -> PathBuf {
     resolved
 }
 
-fn user_install_dir() -> Result<PathBuf, InstallError> {
+fn user_install_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        let home = dirs::home_dir().ok_or(InstallError::MissingHomeDirectory)?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow!("could not determine the current user's home directory"))?;
         Ok(home.join(".acp-agent").join("bin"))
     }
 
     #[cfg(not(windows))]
     {
-        let home = dirs::home_dir().ok_or(InstallError::MissingHomeDirectory)?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow!("could not determine the current user's home directory"))?;
         Ok(home.join(".local").join("bin"))
     }
 }
@@ -279,7 +306,7 @@ pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-async fn run_command<I, S>(program: &str, args: I, subject: &str) -> Result<(), InstallError>
+async fn run_command<I, S>(program: &str, args: I, subject: &str) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -289,10 +316,7 @@ where
         .args(&args_vec)
         .output()
         .await
-        .map_err(|error| InstallError::CommandIo {
-            program: program.to_string(),
-            source: error,
-        })?;
+        .with_context(|| format!("failed to run {program}"))?;
 
     if output.status.success() {
         return Ok(());
@@ -302,11 +326,11 @@ where
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() { stderr } else { stdout };
 
-    Err(InstallError::CommandFailed {
-        program: program.to_string(),
-        subject: subject.to_string(),
-        detail,
-    })
+    if detail.is_empty() {
+        bail!("failed to run {program} for {subject}");
+    }
+
+    bail!("failed to run {program} for {subject}: {detail}");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,8 +353,8 @@ pub enum InstallOutcome {
     },
 }
 
-impl fmt::Display for InstallOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for InstallOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binary { agent_id, path } => {
                 write!(f, "Installed {agent_id} to {}", path.display())
@@ -347,114 +371,6 @@ impl fmt::Display for InstallOutcome {
                 };
                 write!(f, "Installed {agent_id} via {installer}: {package}")
             }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum InstallError {
-    FetchRegistry(FetchRegistryError),
-    AgentNotFound(AgentNotFoundError),
-    UnsupportedPlatform(UnsupportedPlatformError),
-    UnavailableDistribution {
-        agent_id: String,
-    },
-    InvalidArchiveUrl(String),
-    UnsupportedArchiveFormat(String),
-    InvalidCommandPath(String),
-    BinaryNotFound {
-        archive: String,
-        cmd: String,
-        resolved_path: PathBuf,
-    },
-    UnsafeArchiveEntry(String),
-    MissingHomeDirectory,
-    Request(reqwest::Error),
-    Io(io::Error),
-    Zip(zip::result::ZipError),
-    Join(tokio::task::JoinError),
-    CommandIo {
-        program: String,
-        source: io::Error,
-    },
-    CommandFailed {
-        program: String,
-        subject: String,
-        detail: String,
-    },
-}
-
-impl fmt::Display for InstallError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FetchRegistry(error) => write!(f, "{error}"),
-            Self::AgentNotFound(error) => write!(f, "{error}"),
-            Self::UnsupportedPlatform(error) => write!(f, "{error}"),
-            Self::UnavailableDistribution { agent_id } => {
-                write!(
-                    f,
-                    "Agent \"{agent_id}\" does not have an installable distribution"
-                )
-            }
-            Self::InvalidArchiveUrl(url) => write!(f, "Invalid archive URL: {url}"),
-            Self::UnsupportedArchiveFormat(path) => {
-                write!(f, "Unsupported archive format for {path}")
-            }
-            Self::InvalidCommandPath(cmd) => write!(f, "Invalid binary command path: {cmd}"),
-            Self::BinaryNotFound {
-                archive,
-                cmd,
-                resolved_path,
-            } => write!(
-                f,
-                "Downloaded {archive}, but could not find \"{cmd}\" at {}",
-                resolved_path.display()
-            ),
-            Self::UnsafeArchiveEntry(entry) => write!(f, "Archive contains unsafe path: {entry}"),
-            Self::MissingHomeDirectory => {
-                write!(f, "Could not determine the current user's home directory")
-            }
-            Self::Request(error) => write!(f, "Network request failed: {error}"),
-            Self::Io(error) => write!(f, "I/O failed: {error}"),
-            Self::Zip(error) => write!(f, "ZIP extraction failed: {error}"),
-            Self::Join(error) => write!(f, "Blocking task failed: {error}"),
-            Self::CommandIo { program, source } => {
-                write!(f, "Failed to execute {program}: {source}")
-            }
-            Self::CommandFailed {
-                program,
-                subject,
-                detail,
-            } => {
-                if detail.is_empty() {
-                    write!(f, "{program} failed while installing {subject}")
-                } else {
-                    write!(f, "{program} failed while installing {subject}: {detail}")
-                }
-            }
-        }
-    }
-}
-
-impl Error for InstallError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Request(error) => Some(error),
-            Self::Io(error) => Some(error),
-            Self::Zip(error) => Some(error),
-            Self::Join(error) => Some(error),
-            Self::CommandIo { source, .. } => Some(source),
-            Self::FetchRegistry(_)
-            | Self::AgentNotFound(_)
-            | Self::UnsupportedPlatform(_)
-            | Self::UnavailableDistribution { .. }
-            | Self::InvalidArchiveUrl(_)
-            | Self::UnsupportedArchiveFormat(_)
-            | Self::InvalidCommandPath(_)
-            | Self::BinaryNotFound { .. }
-            | Self::UnsafeArchiveEntry(_)
-            | Self::MissingHomeDirectory
-            | Self::CommandFailed { .. } => None,
         }
     }
 }
@@ -505,9 +421,9 @@ mod tests {
         .await
         .expect_err("install should fail");
 
-        match error {
-            InstallError::UnavailableDistribution { agent_id } => assert_eq!(agent_id, "demo"),
-            other => panic!("unexpected error: {other}"),
-        }
+        assert_eq!(
+            error.to_string(),
+            "agent \"demo\" does not have an installable distribution"
+        );
     }
 }

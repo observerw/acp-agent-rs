@@ -1,12 +1,12 @@
-use std::error::Error;
-use std::fmt;
 use std::io::{self, Write};
 
-use crate::registry::{FetchRegistryError, Registry, fetch_registry};
+use anyhow::{Context, Result};
 
-pub async fn list_agents<W: Write>(writer: &mut W) -> Result<(), ListError> {
-    let registry = fetch_registry().await.map_err(ListError::FetchRegistry)?;
-    write_agent_list(&registry, writer).map_err(ListError::Write)
+use crate::registry::{Registry, fetch_registry};
+
+pub async fn list_agents<W: Write>(writer: &mut W) -> Result<()> {
+    let registry = fetch_registry().await?;
+    write_agent_list(&registry, writer).context("failed to write agent list")
 }
 
 fn write_agent_list<W: Write>(registry: &Registry, writer: &mut W) -> io::Result<()> {
@@ -28,31 +28,6 @@ fn write_agent_list<W: Write>(registry: &Registry, writer: &mut W) -> io::Result
 
     Ok(())
 }
-
-#[derive(Debug)]
-pub enum ListError {
-    FetchRegistry(FetchRegistryError),
-    Write(io::Error),
-}
-
-impl fmt::Display for ListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FetchRegistry(error) => write!(f, "{error}"),
-            Self::Write(error) => write!(f, "Failed to write agent list: {error}"),
-        }
-    }
-}
-
-impl Error for ListError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::FetchRegistry(error) => Some(error),
-            Self::Write(error) => Some(error),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

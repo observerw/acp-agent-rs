@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt;
 use std::str::FromStr;
 
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -105,14 +104,13 @@ impl AgentDistribution {
         self.binary.is_some() || self.npx.is_some() || self.uvx.is_some()
     }
 
-    fn validate(&self, path: &str) -> Result<(), RegistryDecodeError> {
+    fn validate(&self, path: &str) -> Result<()> {
         if self.has_distribution_source() {
             Ok(())
         } else {
-            Err(RegistryDecodeError::new(
-                REGISTRY_URL,
-                format!("{path}.distribution must contain at least one of binary, npx, or uvx"),
-            ))
+            Err(registry_decode_error(format!(
+                "{path}.distribution must contain at least one of binary, npx, or uvx"
+            )))
         }
     }
 }
@@ -156,21 +154,21 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn from_slice(input: &[u8]) -> Result<Self, RegistryDecodeError> {
+    pub fn from_slice(input: &[u8]) -> Result<Self> {
         let registry: Self =
-            serde_json::from_slice(input).map_err(RegistryDecodeError::from_json)?;
+            serde_json::from_slice(input).map_err(|error| registry_decode_error(error))?;
         registry.validate()?;
         Ok(registry)
     }
 
-    pub fn from_value(input: Value) -> Result<Self, RegistryDecodeError> {
+    pub fn from_value(input: Value) -> Result<Self> {
         let registry: Self =
-            serde_json::from_value(input).map_err(RegistryDecodeError::from_json)?;
+            serde_json::from_value(input).map_err(|error| registry_decode_error(error))?;
         registry.validate()?;
         Ok(registry)
     }
 
-    pub fn validate(&self) -> Result<(), RegistryDecodeError> {
+    pub fn validate(&self) -> Result<()> {
         for (index, agent) in self.agents.iter().enumerate() {
             let path = format!("agents[{index}]");
             agent.distribution.validate(&path)?;
@@ -187,9 +185,9 @@ impl Registry {
         self.agents.iter().find(|agent| agent.id == agent_id)
     }
 
-    pub fn get_agent(&self, agent_id: &str) -> Result<&RegistryAgent, AgentNotFoundError> {
+    pub fn get_agent(&self, agent_id: &str) -> Result<&RegistryAgent> {
         self.find_agent(agent_id)
-            .ok_or_else(|| AgentNotFoundError::new(agent_id))
+            .ok_or_else(|| anyhow!("agent with id \"{agent_id}\" was not found"))
     }
 
     pub fn search_agents(&self, query: &str) -> Vec<&RegistryAgent> {
@@ -214,17 +212,18 @@ impl Registry {
 }
 
 impl FromStr for Registry {
-    type Err = RegistryDecodeError;
+    type Err = anyhow::Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let registry: Self = serde_json::from_str(input).map_err(RegistryDecodeError::from_json)?;
+        let registry: Self =
+            serde_json::from_str(input).map_err(|error| registry_decode_error(error))?;
         registry.validate()?;
         Ok(registry)
     }
 }
 
 impl Platform {
-    pub fn current() -> Result<Self, UnsupportedPlatformError> {
+    pub fn current() -> Result<Self> {
         match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => Ok(Self::DarwinAarch64),
             ("macos", "x86_64") => Ok(Self::DarwinX86_64),
@@ -232,122 +231,27 @@ impl Platform {
             ("linux", "x86_64") => Ok(Self::LinuxX86_64),
             ("windows", "aarch64") => Ok(Self::WindowsAarch64),
             ("windows", "x86_64") => Ok(Self::WindowsX86_64),
-            (os, arch) => Err(UnsupportedPlatformError::new(os, arch)),
+            (os, arch) => Err(anyhow!("unsupported platform: {os}-{arch}")),
         }
     }
 }
 
-pub async fn fetch_registry() -> Result<Registry, FetchRegistryError> {
+pub async fn fetch_registry() -> Result<Registry> {
     let response = reqwest::get(REGISTRY_URL)
         .await
-        .map_err(FetchRegistryError::Request)?;
+        .map_err(|error| anyhow!("failed to fetch registry payload: {error}"))?;
     let response = response
         .error_for_status()
-        .map_err(FetchRegistryError::Request)?;
+        .map_err(|error| anyhow!("failed to fetch registry payload: {error}"))?;
     let bytes = response
         .bytes()
         .await
-        .map_err(FetchRegistryError::Request)?;
-    Registry::from_slice(bytes.as_ref()).map_err(FetchRegistryError::Decode)
+        .map_err(|error| anyhow!("failed to fetch registry payload: {error}"))?;
+    Registry::from_slice(bytes.as_ref())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistryDecodeError {
-    pub url: &'static str,
-    pub reason: String,
-}
-
-impl RegistryDecodeError {
-    pub fn new(url: &'static str, reason: impl Into<String>) -> Self {
-        Self {
-            url,
-            reason: reason.into(),
-        }
-    }
-
-    fn from_json(error: serde_json::Error) -> Self {
-        Self::new(REGISTRY_URL, error.to_string())
-    }
-}
-
-impl fmt::Display for RegistryDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Failed to decode registry payload from {}: {}",
-            self.url, self.reason
-        )
-    }
-}
-
-impl Error for RegistryDecodeError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentNotFoundError {
-    pub agent_id: String,
-}
-
-impl AgentNotFoundError {
-    pub fn new(agent_id: impl Into<String>) -> Self {
-        Self {
-            agent_id: agent_id.into(),
-        }
-    }
-}
-
-impl fmt::Display for AgentNotFoundError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Agent with id \"{}\" was not found", self.agent_id)
-    }
-}
-
-impl Error for AgentNotFoundError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedPlatformError {
-    pub os: String,
-    pub arch: String,
-}
-
-impl UnsupportedPlatformError {
-    pub fn new(os: impl Into<String>, arch: impl Into<String>) -> Self {
-        Self {
-            os: os.into(),
-            arch: arch.into(),
-        }
-    }
-}
-
-impl fmt::Display for UnsupportedPlatformError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Unsupported platform: {}-{}", self.os, self.arch)
-    }
-}
-
-impl Error for UnsupportedPlatformError {}
-
-#[derive(Debug)]
-pub enum FetchRegistryError {
-    Request(reqwest::Error),
-    Decode(RegistryDecodeError),
-}
-
-impl fmt::Display for FetchRegistryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Request(error) => write!(f, "Failed to fetch registry payload: {error}"),
-            Self::Decode(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl Error for FetchRegistryError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Request(error) => Some(error),
-            Self::Decode(error) => Some(error),
-        }
-    }
+fn registry_decode_error(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("failed to decode registry payload from {REGISTRY_URL}: {reason}")
 }
 
 #[cfg(test)]
@@ -407,7 +311,7 @@ mod tests {
 
         assert!(
             error
-                .reason
+                .to_string()
                 .contains("distribution must contain at least one of binary, npx, or uvx")
         );
     }

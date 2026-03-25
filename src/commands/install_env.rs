@@ -1,19 +1,15 @@
 use std::env;
-use std::error::Error;
-use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 const JS_TOOLS: [&str; 4] = ["npm", "yarn", "pnpm", "bun"];
 const PYTHON_TOOLS: [&str; 2] = ["pip", "uv"];
 
-pub async fn install_env<W: Write>(
-    writer: &mut W,
-    assume_yes: bool,
-) -> Result<(), InstallEnvError> {
+pub async fn install_env<W: Write>(writer: &mut W, assume_yes: bool) -> Result<()> {
     let report = detect_environment()?;
     write_detection_report(&report, writer)?;
 
@@ -202,14 +198,14 @@ struct InstallationResult {
     on_path: bool,
 }
 
-fn detect_environment() -> Result<EnvironmentReport, InstallEnvError> {
+fn detect_environment() -> Result<EnvironmentReport> {
     Ok(EnvironmentReport {
         js: detect_tools(&JS_TOOLS)?,
         python: detect_tools(&PYTHON_TOOLS)?,
     })
 }
 
-fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>, InstallEnvError> {
+fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>> {
     programs
         .iter()
         .copied()
@@ -222,10 +218,7 @@ fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>, Inst
         .collect()
 }
 
-fn write_detection_report<W: Write>(
-    report: &EnvironmentReport,
-    writer: &mut W,
-) -> Result<(), InstallEnvError> {
+fn write_detection_report<W: Write>(report: &EnvironmentReport, writer: &mut W) -> Result<()> {
     writeln!(writer, "Environment detection results:")?;
     writeln!(writer, "JavaScript tools:")?;
     write_tool_group(&report.js, writer)?;
@@ -234,10 +227,7 @@ fn write_detection_report<W: Write>(
     Ok(())
 }
 
-fn write_tool_group<W: Write>(
-    tools: &[ToolAvailability],
-    writer: &mut W,
-) -> Result<(), InstallEnvError> {
+fn write_tool_group<W: Write>(tools: &[ToolAvailability], writer: &mut W) -> Result<()> {
     for tool in tools {
         match &tool.path {
             Some(path) => writeln!(writer, "{}: available ({})", tool.name, path.display())?,
@@ -248,10 +238,7 @@ fn write_tool_group<W: Write>(
     Ok(())
 }
 
-fn prompt_for_installation<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-) -> Result<bool, InstallEnvError> {
+fn prompt_for_installation<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<bool> {
     loop {
         write!(writer, "Proceed with installation? [Y/n]: ")?;
         writer.flush()?;
@@ -272,9 +259,7 @@ fn prompt_for_installation<R: BufRead, W: Write>(
     }
 }
 
-async fn run_installation_plan(
-    plan: &InstallationPlan,
-) -> Result<Vec<InstallationResult>, InstallEnvError> {
+async fn run_installation_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
     match plan.targets.as_slice() {
         [] => Ok(Vec::new()),
         [target] => Ok(vec![install_and_verify(*target).await?]),
@@ -287,54 +272,56 @@ async fn run_installation_plan(
     }
 }
 
-async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult, InstallEnvError> {
+async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult> {
     run_installer(target).await?;
     verify_installation(target).await
 }
 
-async fn run_installer(target: InstallTarget) -> Result<(), InstallEnvError> {
+async fn run_installer(target: InstallTarget) -> Result<()> {
     ensure_installer_prerequisites(target)?;
     let (program, args) = target.shell_command();
     let output = Command::new(program)
         .args(args)
         .output()
         .await
-        .map_err(|source| InstallEnvError::CommandIo {
-            subject: target.label().to_string(),
-            source,
-        })?;
+        .with_context(|| format!("failed to run installer for {}", target.label()))?;
 
     if output.status.success() {
         return Ok(());
     }
 
-    Err(InstallEnvError::CommandFailed {
-        subject: target.label().to_string(),
-        status: output.status,
-        output: render_output(&output.stdout, &output.stderr),
-    })
+    bail!(
+        "installer for {} failed with status {}: {}",
+        target.label(),
+        display_status(output.status),
+        render_output(&output.stdout, &output.stderr)
+    )
 }
 
-fn ensure_installer_prerequisites(target: InstallTarget) -> Result<(), InstallEnvError> {
+fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
     if target.requires_curl() && resolve_program("curl")?.is_none() {
-        return Err(InstallEnvError::CurlUnavailable {
-            subject: target.label().to_string(),
-        });
+        return Err(anyhow!(
+            "Cannot install {} because curl is not available in the current environment",
+            target.label()
+        ));
     }
 
     Ok(())
 }
 
-async fn verify_installation(target: InstallTarget) -> Result<InstallationResult, InstallEnvError> {
+async fn verify_installation(target: InstallTarget) -> Result<InstallationResult> {
     let on_path = resolve_program(target.program())?.is_some();
-    let home = dirs::home_dir().ok_or(InstallEnvError::HomeDirectoryUnavailable)?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to determine the home directory"))?;
     let path = if let Some(path) = resolve_program(target.program())? {
         path
     } else {
         resolve_program_with_directories(target.program(), &target.known_bin_directories(&home))?
-            .ok_or(InstallEnvError::VerificationFailed {
-                subject: target.label().to_string(),
-                reason: format!("{} was not found after installation", target.program()),
+            .ok_or_else(|| {
+                anyhow!(
+                    "verification failed for {}: {} was not found after installation",
+                    target.label(),
+                    target.program()
+                )
             })?
     };
 
@@ -346,24 +333,21 @@ async fn verify_installation(target: InstallTarget) -> Result<InstallationResult
     })
 }
 
-async fn verify_program_version(path: &Path, subject: &str) -> Result<(), InstallEnvError> {
+async fn verify_program_version(path: &Path, subject: &str) -> Result<()> {
     let output = Command::new(path)
         .arg("--version")
         .output()
         .await
-        .map_err(|source| InstallEnvError::CommandIo {
-            subject: subject.to_string(),
-            source,
-        })?;
+        .with_context(|| format!("failed to run installer for {subject}"))?;
 
     if output.status.success() {
         return Ok(());
     }
 
-    Err(InstallEnvError::VerificationFailed {
-        subject: subject.to_string(),
-        reason: render_output(&output.stdout, &output.stderr),
-    })
+    bail!(
+        "verification failed for {subject}: {}",
+        render_output(&output.stdout, &output.stderr)
+    )
 }
 
 fn render_output(stdout: &[u8], stderr: &[u8]) -> String {
@@ -378,14 +362,14 @@ fn render_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-fn resolve_program(program: &str) -> Result<Option<PathBuf>, InstallEnvError> {
+fn resolve_program(program: &str) -> Result<Option<PathBuf>> {
     resolve_program_with_directories(program, &Vec::new())
 }
 
 fn resolve_program_with_directories(
     program: &str,
     preferred_directories: &[PathBuf],
-) -> Result<Option<PathBuf>, InstallEnvError> {
+) -> Result<Option<PathBuf>> {
     let mut directories = preferred_directories.to_vec();
     if let Some(path_value) = env::var_os("PATH") {
         directories.extend(env::split_paths(&path_value));
@@ -411,75 +395,6 @@ fn executable_extensions() -> &'static [&'static str] {
 #[cfg(not(windows))]
 fn executable_extensions() -> &'static [&'static str] {
     &[""]
-}
-
-#[derive(Debug)]
-pub enum InstallEnvError {
-    Io(io::Error),
-    HomeDirectoryUnavailable,
-    CurlUnavailable {
-        subject: String,
-    },
-    CommandIo {
-        subject: String,
-        source: io::Error,
-    },
-    CommandFailed {
-        subject: String,
-        status: ExitStatus,
-        output: String,
-    },
-    VerificationFailed {
-        subject: String,
-        reason: String,
-    },
-}
-
-impl fmt::Display for InstallEnvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(source) => write!(f, "I/O failed: {source}"),
-            Self::HomeDirectoryUnavailable => write!(f, "Unable to determine the home directory"),
-            Self::CurlUnavailable { subject } => write!(
-                f,
-                "Cannot install {subject} because curl is not available in the current environment"
-            ),
-            Self::CommandIo { subject, source } => {
-                write!(f, "Failed to run installer for {subject}: {source}")
-            }
-            Self::CommandFailed {
-                subject,
-                status,
-                output,
-            } => write!(
-                f,
-                "Installer for {subject} failed with status {}: {output}",
-                display_status(*status)
-            ),
-            Self::VerificationFailed { subject, reason } => {
-                write!(f, "Verification failed for {subject}: {reason}")
-            }
-        }
-    }
-}
-
-impl Error for InstallEnvError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io(source) => Some(source),
-            Self::CommandIo { source, .. } => Some(source),
-            Self::HomeDirectoryUnavailable
-            | Self::CurlUnavailable { .. }
-            | Self::CommandFailed { .. }
-            | Self::VerificationFailed { .. } => None,
-        }
-    }
-}
-
-impl From<io::Error> for InstallEnvError {
-    fn from(source: io::Error) -> Self {
-        Self::Io(source)
-    }
 }
 
 fn display_status(status: ExitStatus) -> String {
@@ -569,9 +484,8 @@ mod tests {
 
     #[test]
     fn reports_clear_error_when_curl_is_missing() {
-        let error = InstallEnvError::CurlUnavailable {
-            subject: "bun".to_string(),
-        };
+        let error =
+            anyhow!("Cannot install bun because curl is not available in the current environment");
 
         assert_eq!(
             error.to_string(),

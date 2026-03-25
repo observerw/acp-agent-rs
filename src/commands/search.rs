@@ -1,12 +1,12 @@
-use std::error::Error;
-use std::fmt;
 use std::io::{self, Write};
 
-use crate::registry::{FetchRegistryError, Registry, fetch_registry};
+use anyhow::{Context, Result};
 
-pub async fn search_agents<W: Write>(query: &str, writer: &mut W) -> Result<(), SearchError> {
-    let registry = fetch_registry().await.map_err(SearchError::FetchRegistry)?;
-    write_search_results(&registry, query, writer).map_err(SearchError::Write)
+use crate::registry::{Registry, fetch_registry};
+
+pub async fn search_agents<W: Write>(query: &str, writer: &mut W) -> Result<()> {
+    let registry = fetch_registry().await?;
+    write_search_results(&registry, query, writer).context("failed to write search results")
 }
 
 fn write_search_results<W: Write>(
@@ -32,31 +32,6 @@ fn write_search_results<W: Write>(
 
     Ok(())
 }
-
-#[derive(Debug)]
-pub enum SearchError {
-    FetchRegistry(FetchRegistryError),
-    Write(io::Error),
-}
-
-impl fmt::Display for SearchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FetchRegistry(error) => write!(f, "{error}"),
-            Self::Write(error) => write!(f, "Failed to write search results: {error}"),
-        }
-    }
-}
-
-impl Error for SearchError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::FetchRegistry(error) => Some(error),
-            Self::Write(error) => Some(error),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

@@ -37,7 +37,11 @@ enum Commands {
     #[command(trailing_var_arg = true)]
     Run {
         agent_id: String,
-        #[arg(long, default_value = "stdio", help = "stdio or single-session HTTP/2 byte stream")]
+        #[arg(
+            long,
+            default_value = "stdio",
+            help = "stdio, single-session HTTP/2 byte stream, or jsonrpsee WebSocket bridge"
+        )]
         transport: run::RunTransport,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -260,6 +264,36 @@ mod tests {
                 assert_eq!(transport, run::RunTransport::Http);
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(port, 9000);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_run_subcommand_with_ws_transport() {
+        let cli = Cli::try_parse_from([
+            "acp-agent",
+            "run",
+            "demo-agent",
+            "--transport",
+            "ws",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9010",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Run {
+                transport,
+                host,
+                port,
+                ..
+            } => {
+                assert_eq!(transport, run::RunTransport::Ws);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 9010);
             }
             command => panic!("unexpected command: {command:?}"),
         }
