@@ -1,4 +1,2 @@
-pub mod install;
+pub mod commands;
 pub mod registry;
-pub mod run;
-pub mod serve;

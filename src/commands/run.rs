@@ -5,7 +5,7 @@ use std::process::{ExitStatus, Stdio};
 
 use tokio::process::Command;
 
-use crate::install::{
+use super::install::{
     CommandSpec, InstallError, PreparedCommand, apply_command_spec, binary_command_spec,
     download_archive, extract_archive, make_executable, package_command_spec, resolve_cmd_path,
 };

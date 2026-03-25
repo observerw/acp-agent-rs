@@ -7,9 +7,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
 use tokio::process::{Child, Command};
 
-use crate::install::{PreparedCommand, apply_command_spec};
+use super::install::{PreparedCommand, apply_command_spec};
+use super::run::{RunError, prepare_run_command};
 use crate::registry::fetch_registry;
-use crate::run::{RunError, prepare_run_command};
 
 type BridgeTaskHandle = tokio::task::JoinHandle<Result<(), ServeError>>;
 type BridgeTaskResult = Result<Result<(), ServeError>, tokio::task::JoinError>;
@@ -284,8 +284,8 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use super::super::install::{CommandSpec, PreparedCommand};
     use super::*;
-    use crate::install::{CommandSpec, PreparedCommand};
 
     #[cfg(unix)]
     #[tokio::test]
