@@ -247,58 +247,6 @@ pub(crate) fn resolve_cmd_path(extracted_dir: &Path, cmd: &str) -> PathBuf {
     resolved
 }
 
-pub(crate) fn package_command_spec(
-    program: &str,
-    package: &str,
-    args: Option<&Vec<String>>,
-    env: Option<&crate::registry::Environment>,
-    user_args: &[String],
-) -> CommandSpec {
-    let mut command_args = vec![OsString::from(package)];
-    if let Some(args) = args {
-        command_args.extend(args.iter().cloned().map(OsString::from));
-    }
-    command_args.extend(user_args.iter().cloned().map(OsString::from));
-
-    CommandSpec {
-        program: OsString::from(program),
-        args: command_args,
-        env: clone_env_pairs(env),
-        current_dir: None,
-    }
-}
-
-pub(crate) fn binary_command_spec(
-    executable_path: PathBuf,
-    extracted_dir: PathBuf,
-    target: &BinaryTarget,
-    user_args: &[String],
-) -> CommandSpec {
-    let mut args: Vec<OsString> = target
-        .args
-        .as_ref()
-        .into_iter()
-        .flatten()
-        .cloned()
-        .map(OsString::from)
-        .collect();
-    args.extend(user_args.iter().cloned().map(OsString::from));
-
-    CommandSpec {
-        program: executable_path.into_os_string(),
-        args,
-        env: clone_env_pairs(target.env.as_ref()),
-        current_dir: Some(extracted_dir),
-    }
-}
-
-fn clone_env_pairs(env: Option<&crate::registry::Environment>) -> Vec<(OsString, OsString)> {
-    env.into_iter()
-        .flat_map(|pairs| pairs.iter())
-        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-        .collect()
-}
-
 fn user_install_dir() -> Result<PathBuf, InstallError> {
     #[cfg(windows)]
     {
@@ -359,32 +307,6 @@ where
         subject: subject.to_string(),
         detail,
     })
-}
-
-pub(crate) fn apply_command_spec(command: &mut Command, spec: &CommandSpec) {
-    command.args(&spec.args);
-
-    if let Some(current_dir) = &spec.current_dir {
-        command.current_dir(current_dir);
-    }
-
-    for (key, value) in &spec.env {
-        command.env(key, value);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommandSpec {
-    pub(crate) program: OsString,
-    pub(crate) args: Vec<OsString>,
-    pub(crate) env: Vec<(OsString, OsString)>,
-    pub(crate) current_dir: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-pub(crate) struct PreparedCommand {
-    pub(crate) spec: CommandSpec,
-    pub(crate) temp_dir: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,65 +509,5 @@ mod tests {
             InstallError::UnavailableDistribution { agent_id } => assert_eq!(agent_id, "demo"),
             other => panic!("unexpected error: {other}"),
         }
-    }
-
-    #[test]
-    fn builds_npx_command_spec_with_args_and_env() {
-        let mut env = crate::registry::Environment::new();
-        env.insert("FOO".to_string(), "bar".to_string());
-
-        let spec = package_command_spec(
-            "npx",
-            "@example/demo",
-            Some(&vec!["--acp".to_string()]),
-            Some(&env),
-            &["--model".to_string(), "gpt-5".to_string()],
-        );
-
-        assert_eq!(spec.program, OsString::from("npx"));
-        assert_eq!(
-            spec.args,
-            vec![
-                OsString::from("@example/demo"),
-                OsString::from("--acp"),
-                OsString::from("--model"),
-                OsString::from("gpt-5"),
-            ]
-        );
-        assert_eq!(
-            spec.env,
-            vec![(OsString::from("FOO"), OsString::from("bar"))]
-        );
-        assert!(spec.current_dir.is_none());
-    }
-
-    #[test]
-    fn builds_binary_command_spec_with_current_dir() {
-        let executable = PathBuf::from("/tmp/acp-agent/bin/demo");
-        let root = PathBuf::from("/tmp/acp-agent");
-        let target = BinaryTarget {
-            archive: "https://example.com/demo.tar.gz".to_string(),
-            cmd: "./bin/demo".to_string(),
-            args: Some(vec!["serve".to_string()]),
-            env: None,
-        };
-
-        let spec = binary_command_spec(
-            executable.clone(),
-            root.clone(),
-            &target,
-            &["--port".to_string(), "3000".to_string()],
-        );
-
-        assert_eq!(spec.program, executable.into_os_string());
-        assert_eq!(
-            spec.args,
-            vec![
-                OsString::from("serve"),
-                OsString::from("--port"),
-                OsString::from("3000"),
-            ]
-        );
-        assert_eq!(spec.current_dir, Some(root));
     }
 }

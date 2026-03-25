@@ -1,41 +1,30 @@
 use std::error::Error;
-use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 
-use clap::ValueEnum;
 use tokio::process::Command;
 
 use super::install::{
-    InstallError, download_archive, extract_archive, make_executable, resolve_cmd_path,
+    CommandSpec, InstallError, PreparedCommand, apply_command_spec, binary_command_spec,
+    download_archive, extract_archive, make_executable, package_command_spec, resolve_cmd_path,
 };
 use crate::registry::{
-    AgentNotFoundError, BinaryTarget, Environment, FetchRegistryError, Platform, RegistryAgent,
-    UnsupportedPlatformError, fetch_registry,
+    AgentNotFoundError, FetchRegistryError, Platform, RegistryAgent, UnsupportedPlatformError,
+    fetch_registry,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum RunTransport {
-    Stdio,
-}
-
-pub async fn run_agent(
-    agent_id: &str,
-    transport: RunTransport,
-    user_args: &[String],
-) -> Result<ExitStatus, RunError> {
+pub async fn run_agent(agent_id: &str, user_args: &[String]) -> Result<ExitStatus, RunError> {
     let registry = fetch_registry().await.map_err(RunError::FetchRegistry)?;
     let agent = registry
         .get_agent(agent_id)
         .map_err(RunError::AgentNotFound)?;
 
     let prepared = prepare_run_command(agent, user_args).await?;
-    run_prepared_command(prepared, transport, &agent.id).await
+    run_prepared_command(prepared, &agent.id).await
 }
 
-async fn prepare_run_command(
+pub(crate) async fn prepare_run_command(
     agent: &RegistryAgent,
     user_args: &[String],
 ) -> Result<PreparedCommand, RunError> {
@@ -113,19 +102,15 @@ async fn prepare_run_command(
     })
 }
 
-async fn run_prepared_command(
+pub(crate) async fn run_prepared_command(
     prepared: PreparedCommand,
-    transport: RunTransport,
     subject: &str,
 ) -> Result<ExitStatus, RunError> {
     let _temp_dir = prepared.temp_dir;
-
-    match transport {
-        RunTransport::Stdio => run_command_stdio(prepared.spec, subject).await,
-    }
+    run_command_interactive(prepared.spec, subject).await
 }
 
-async fn run_command_stdio(spec: CommandSpec, subject: &str) -> Result<ExitStatus, RunError> {
+async fn run_command_interactive(spec: CommandSpec, subject: &str) -> Result<ExitStatus, RunError> {
     let program_display = spec.program.to_string_lossy().into_owned();
     let mut command = Command::new(&spec.program);
     apply_command_spec(&mut command, &spec);
@@ -141,84 +126,6 @@ async fn run_command_stdio(spec: CommandSpec, subject: &str) -> Result<ExitStatu
     })
 }
 
-fn package_command_spec(
-    program: &str,
-    package: &str,
-    args: Option<&Vec<String>>,
-    env: Option<&Environment>,
-    user_args: &[String],
-) -> CommandSpec {
-    let mut command_args = vec![OsString::from(package)];
-    if let Some(args) = args {
-        command_args.extend(args.iter().cloned().map(OsString::from));
-    }
-    command_args.extend(user_args.iter().cloned().map(OsString::from));
-
-    CommandSpec {
-        program: OsString::from(program),
-        args: command_args,
-        env: clone_env_pairs(env),
-        current_dir: None,
-    }
-}
-
-fn binary_command_spec(
-    executable_path: PathBuf,
-    extracted_dir: PathBuf,
-    target: &BinaryTarget,
-    user_args: &[String],
-) -> CommandSpec {
-    let mut args: Vec<OsString> = target
-        .args
-        .as_ref()
-        .into_iter()
-        .flatten()
-        .cloned()
-        .map(OsString::from)
-        .collect();
-    args.extend(user_args.iter().cloned().map(OsString::from));
-
-    CommandSpec {
-        program: executable_path.into_os_string(),
-        args,
-        env: clone_env_pairs(target.env.as_ref()),
-        current_dir: Some(extracted_dir),
-    }
-}
-
-fn clone_env_pairs(env: Option<&Environment>) -> Vec<(OsString, OsString)> {
-    env.into_iter()
-        .flat_map(|pairs| pairs.iter())
-        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-        .collect()
-}
-
-fn apply_command_spec(command: &mut Command, spec: &CommandSpec) {
-    command.args(&spec.args);
-
-    if let Some(current_dir) = &spec.current_dir {
-        command.current_dir(current_dir);
-    }
-
-    for (key, value) in &spec.env {
-        command.env(key, value);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandSpec {
-    program: OsString,
-    args: Vec<OsString>,
-    env: Vec<(OsString, OsString)>,
-    current_dir: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-struct PreparedCommand {
-    spec: CommandSpec,
-    temp_dir: Option<tempfile::TempDir>,
-}
-
 #[derive(Debug)]
 pub enum RunError {
     FetchRegistry(FetchRegistryError),
@@ -228,10 +135,11 @@ pub enum RunError {
         agent_id: String,
     },
     InvalidArchiveUrl(String),
+    InvalidCommandPath(String),
     BinaryNotFound {
         archive: String,
         cmd: String,
-        resolved_path: PathBuf,
+        resolved_path: std::path::PathBuf,
     },
     UnsupportedArchiveFormat(String),
     UnsafeArchiveEntry(String),
@@ -247,9 +155,10 @@ pub enum RunError {
 }
 
 impl RunError {
-    fn from_install(error: InstallError) -> Self {
+    pub(crate) fn from_install(error: InstallError) -> Self {
         match error {
             InstallError::InvalidArchiveUrl(url) => Self::InvalidArchiveUrl(url),
+            InstallError::InvalidCommandPath(cmd) => Self::InvalidCommandPath(cmd),
             InstallError::BinaryNotFound {
                 archive,
                 cmd,
@@ -271,10 +180,6 @@ impl RunError {
             InstallError::UnavailableDistribution { agent_id } => {
                 Self::UnavailableDistribution { agent_id }
             }
-            InstallError::InvalidCommandPath(cmd) => Self::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid binary command path: {cmd}"),
-            )),
             InstallError::MissingHomeDirectory => Self::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Could not determine the current user's home directory",
@@ -310,6 +215,7 @@ impl fmt::Display for RunError {
                 )
             }
             Self::InvalidArchiveUrl(url) => write!(f, "Invalid archive URL: {url}"),
+            Self::InvalidCommandPath(cmd) => write!(f, "Invalid binary command path: {cmd}"),
             Self::BinaryNotFound {
                 archive,
                 cmd,
@@ -349,6 +255,7 @@ impl Error for RunError {
             | Self::UnsupportedPlatform(_)
             | Self::UnavailableDistribution { .. }
             | Self::InvalidArchiveUrl(_)
+            | Self::InvalidCommandPath(_)
             | Self::BinaryNotFound { .. }
             | Self::UnsupportedArchiveFormat(_)
             | Self::UnsafeArchiveEntry(_) => None,
