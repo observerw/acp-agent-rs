@@ -146,7 +146,7 @@ pub(crate) async fn download_archive(
         .map_err(|_| InstallError::InvalidArchiveUrl(target.archive.clone()))?;
     let archive_name = url
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("download.bin");
     let destination = temp_dir.join(archive_name);
@@ -211,7 +211,6 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<(), InstallErr
         let mut entry = archive.by_index(index).map_err(InstallError::Zip)?;
         let enclosed = entry
             .enclosed_name()
-            .map(PathBuf::from)
             .ok_or_else(|| InstallError::UnsafeArchiveEntry(entry.name().to_string()))?;
         let output_path = destination.join(enclosed);
 

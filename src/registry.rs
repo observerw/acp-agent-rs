@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,12 +156,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn from_str(input: &str) -> Result<Self, RegistryDecodeError> {
-        let registry: Self = serde_json::from_str(input).map_err(RegistryDecodeError::from_json)?;
-        registry.validate()?;
-        Ok(registry)
-    }
-
     pub fn from_slice(input: &[u8]) -> Result<Self, RegistryDecodeError> {
         let registry: Self =
             serde_json::from_slice(input).map_err(RegistryDecodeError::from_json)?;
@@ -215,6 +210,16 @@ impl Registry {
                 .any(|value| value.to_ascii_lowercase().contains(&needle))
             })
             .collect()
+    }
+}
+
+impl FromStr for Registry {
+    type Err = RegistryDecodeError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let registry: Self = serde_json::from_str(input).map_err(RegistryDecodeError::from_json)?;
+        registry.validate()?;
+        Ok(registry)
     }
 }
 
