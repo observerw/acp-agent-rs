@@ -5,6 +5,8 @@ use std::process::ExitStatus;
 
 use crate::registry::fetch_registry;
 use crate::runtime::prepare::prepare_agent_command;
+#[cfg(unix)]
+use crate::runtime::transports::uds;
 use crate::runtime::transports::{h2, tcp, ws};
 
 /// Concrete network serve modes supported by the runtime.
@@ -71,6 +73,6 @@ pub async fn serve_agent(
         ServeMode::Tcp { host, port } => tcp::serve_tcp(prepared, &agent.id, &host, port).await,
         ServeMode::Ws { host, port } => ws::serve_ws(prepared, &agent.id, &host, port).await,
         #[cfg(unix)]
-        ServeMode::Uds { .. } => todo!("UDS transport is implemented in a later refactor step"),
+        ServeMode::Uds { path } => uds::serve_uds(prepared, &agent.id, &path).await,
     }
 }

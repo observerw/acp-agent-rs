@@ -8,5 +8,8 @@ pub mod h2;
 pub mod raw;
 /// Raw TCP byte-stream transport.
 pub mod tcp;
+/// Raw Unix domain socket byte-stream transport.
+#[cfg(unix)]
+pub mod uds;
 /// WebSocket transport: one ACP message per WebSocket text frame.
 pub mod ws;
