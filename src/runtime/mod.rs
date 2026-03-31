@@ -4,6 +4,8 @@
 //! command specs, tracking temporary extraction directories) with the
 //! subprocess primitives and transport implementations that surface an agent's
 //! stdio over different network protocols.
+/// Shared archive download/extraction helpers for binary distributions.
+pub mod distribution;
 /// Command construction and distribution-resolution helpers.
 pub mod prepare;
 /// Low-level child-process spawning and shutdown helpers.

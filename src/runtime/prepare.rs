@@ -1,12 +1,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
-
-use crate::commands::install::{
-    download_archive, extract_archive, make_executable, resolve_cmd_path,
-};
 use crate::registry::{BinaryTarget, Environment, Platform, RegistryAgent};
+use crate::runtime::distribution::prepare_binary_target;
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A concrete instruction set for invoking an agent binary or package runner.
@@ -52,39 +49,16 @@ pub async fn prepare_agent_command(
     if let Some(binary) = &agent.distribution.binary {
         let platform = Platform::current()?;
         if let Some(target) = binary.for_platform(platform) {
-            let temp_dir = tokio::task::spawn_blocking(tempfile::tempdir)
-                .await
-                .context("failed to create temporary directory task")?
-                .context("failed to create temporary directory")?;
-            let archive_path = download_archive(target, temp_dir.path()).await?;
-            let extracted_dir = temp_dir.path().join("extracted");
-            tokio::fs::create_dir_all(&extracted_dir)
-                .await
-                .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
-            extract_archive(archive_path, extracted_dir.clone()).await?;
-
-            let executable_path = resolve_cmd_path(&extracted_dir, &target.cmd);
-            let metadata = tokio::fs::metadata(&executable_path).await;
-            if metadata
-                .as_ref()
-                .map(|metadata| !metadata.is_file())
-                .unwrap_or(true)
-            {
-                bail!(
-                    "downloaded {}, but could not find \"{}\" at {}",
-                    target.archive,
-                    target.cmd,
-                    executable_path.display()
-                );
-            }
-
-            make_executable(&executable_path).await.with_context(|| {
-                format!("failed to mark {} executable", executable_path.display())
-            })?;
+            let prepared_binary = prepare_binary_target(target).await?;
 
             return Ok(PreparedCommand {
-                spec: binary_command_spec(executable_path, extracted_dir, target, user_args),
-                temp_dir: Some(temp_dir),
+                spec: binary_command_spec(
+                    prepared_binary.executable_path,
+                    prepared_binary.extracted_dir,
+                    target,
+                    user_args,
+                ),
+                temp_dir: Some(prepared_binary.temp_dir),
             });
         }
     }

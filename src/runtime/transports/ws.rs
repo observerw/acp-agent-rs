@@ -54,8 +54,7 @@ pub async fn serve_ws(
     serve_ws_connection(prepared.spec, subject, socket).await
 }
 
-#[doc(hidden)]
-pub async fn serve_ws_connection(
+async fn serve_ws_connection(
     spec: CommandSpec,
     subject: &str,
     socket: TcpStream,
