@@ -1,9 +1,15 @@
 use std::io::Write;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use crate::runtime::serve::ServeTransport;
-use anyhow::Context;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::runtime::serve::ServeMode;
+
+const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
+const DEFAULT_SERVE_PORT: u16 = 0;
 
 /// Agent installation entrypoints and install outcome types.
 pub mod install;
@@ -41,6 +47,64 @@ pub struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ServeTransportArg {
+    Http,
+    Tcp,
+    Ws,
+    #[cfg(unix)]
+    Uds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct ServeCliOptions {
+    #[arg(
+        long,
+        default_value = "http",
+        help = "Network transport to expose (http, tcp, ws, or uds on Unix)."
+    )]
+    transport: ServeTransportArg,
+    #[cfg_attr(unix, arg(conflicts_with = "unix_socket"))]
+    #[arg(long)]
+    host: Option<String>,
+    #[cfg_attr(unix, arg(conflicts_with = "unix_socket"))]
+    #[arg(long)]
+    port: Option<u16>,
+    #[cfg(unix)]
+    #[arg(long = "unix-socket", required_if_eq("transport", "uds"))]
+    unix_socket: Option<PathBuf>,
+}
+
+impl ServeCliOptions {
+    fn into_mode(self) -> anyhow::Result<ServeMode> {
+        match self.transport {
+            ServeTransportArg::Http => Ok(ServeMode::Http {
+                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+            }),
+            ServeTransportArg::Tcp => Ok(ServeMode::Tcp {
+                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+            }),
+            ServeTransportArg::Ws => Ok(ServeMode::Ws {
+                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+            }),
+            #[cfg(unix)]
+            ServeTransportArg::Uds => {
+                if self.host.is_some() || self.port.is_some() {
+                    bail!("--transport uds cannot be used with --host or --port");
+                }
+
+                let path = self
+                    .unix_socket
+                    .context("--transport uds requires --unix-socket <path>")?;
+                Ok(ServeMode::Uds { path })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     List,
@@ -66,16 +130,8 @@ enum Commands {
     )]
     Serve {
         agent_id: String,
-        #[arg(
-            long,
-            default_value = "http",
-            help = "Network transport to expose (http, tcp, or ws)."
-        )]
-        transport: ServeTransport,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 0)]
-        port: u16,
+        #[command(flatten)]
+        options: ServeCliOptions,
         #[arg(help = "Arguments passed through to the agent process.")]
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
@@ -136,12 +192,11 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
         }
         Commands::Serve {
             agent_id,
-            transport,
-            host,
-            port,
+            options,
             args,
         } => {
-            let status = serve::serve_agent(&agent_id, transport, host, port, &args)
+            let mode = options.into_mode()?;
+            let status = serve::serve_agent(&agent_id, mode, &args)
                 .await
                 .with_context(|| format!("failed to serve agent \"{agent_id}\""))?;
             Ok(exit_from_status(status))
@@ -250,15 +305,17 @@ mod tests {
         match cli.command {
             Commands::Serve {
                 agent_id,
-                transport,
-                host,
-                port,
+                options,
                 args,
             } => {
                 assert_eq!(agent_id, "demo-agent");
-                assert_eq!(transport, ServeTransport::Http);
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 0);
+                assert_eq!(
+                    options.into_mode().unwrap(),
+                    ServeMode::Http {
+                        host: DEFAULT_SERVE_HOST.to_string(),
+                        port: DEFAULT_SERVE_PORT,
+                    }
+                );
                 assert!(args.is_empty());
             }
             command => panic!("unexpected command: {command:?}"),
@@ -284,16 +341,14 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Serve {
-                transport,
-                host,
-                port,
-                args,
-                ..
-            } => {
-                assert_eq!(transport, ServeTransport::Ws);
-                assert_eq!(host, "0.0.0.0");
-                assert_eq!(port, 8010);
+            Commands::Serve { options, args, .. } => {
+                assert_eq!(
+                    options.into_mode().unwrap(),
+                    ServeMode::Ws {
+                        host: "0.0.0.0".to_string(),
+                        port: 8010,
+                    }
+                );
                 assert_eq!(args, vec!["--model", "gpt-6"]);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -306,9 +361,72 @@ mod tests {
             .unwrap();
 
         match cli.command {
-            Commands::Serve { transport, .. } => assert_eq!(transport, ServeTransport::Tcp),
+            Commands::Serve { options, .. } => {
+                assert_eq!(
+                    options.into_mode().unwrap(),
+                    ServeMode::Tcp {
+                        host: DEFAULT_SERVE_HOST.to_string(),
+                        port: DEFAULT_SERVE_PORT,
+                    }
+                );
+            }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_serve_subcommand_with_uds_transport() {
+        let cli = Cli::try_parse_from([
+            "acp-agent",
+            "serve",
+            "demo-agent",
+            "--transport",
+            "uds",
+            "--unix-socket",
+            "/tmp/acp-agent.sock",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Serve { options, .. } => {
+                assert_eq!(
+                    options.into_mode().unwrap(),
+                    ServeMode::Uds {
+                        path: PathBuf::from("/tmp/acp-agent.sock"),
+                    }
+                );
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_uds_with_host_or_port() {
+        let error = Cli::try_parse_from([
+            "acp-agent",
+            "serve",
+            "demo-agent",
+            "--transport",
+            "uds",
+            "--unix-socket",
+            "/tmp/acp-agent.sock",
+            "--host",
+            "127.0.0.1",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_unix_socket_for_uds() {
+        let error = Cli::try_parse_from(["acp-agent", "serve", "demo-agent", "--transport", "uds"])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

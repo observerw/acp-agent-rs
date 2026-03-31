@@ -1,38 +1,52 @@
 use anyhow::{Context, Result};
-use clap::ValueEnum;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use crate::registry::fetch_registry;
 use crate::runtime::prepare::prepare_agent_command;
 use crate::runtime::transports::{h2, tcp, ws};
 
-/// Indicates which transport protocol will expose the agent's STDIO streams.
+/// Concrete network serve modes supported by the runtime.
 ///
-/// * `Http` stands for the HTTP/2 full-duplex stream transport exposed by `h2`.
-/// * `Tcp` exposes raw bytes over a single TCP connection (no framing or RPC).
-/// * `Ws` exposes one ACP JSON-RPC message per WebSocket text frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ServeTransport {
+/// Each variant fully describes how the agent should be exposed, including the
+/// listener addressing details needed by that transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeMode {
     /// HTTP/2 stream transport implemented by [`crate::runtime::transports::h2`].
-    Http,
+    Http {
+        /// Listener host or IP address to bind.
+        host: String,
+        /// Listener port. `0` lets the OS choose an ephemeral port.
+        port: u16,
+    },
     /// Raw TCP byte-stream transport implemented by [`crate::runtime::transports::tcp`].
-    Tcp,
+    Tcp {
+        /// Listener host or IP address to bind.
+        host: String,
+        /// Listener port. `0` lets the OS choose an ephemeral port.
+        port: u16,
+    },
     /// WebSocket transport: one ACP message per WebSocket frame, implemented by [`crate::runtime::transports::ws`].
-    Ws,
+    Ws {
+        /// Listener host or IP address to bind.
+        host: String,
+        /// Listener port. `0` lets the OS choose an ephemeral port.
+        port: u16,
+    },
+    /// Unix domain socket raw byte-stream transport.
+    #[cfg(unix)]
+    Uds {
+        /// Filesystem path where the Unix domain socket listener will bind.
+        path: PathBuf,
+    },
 }
 
-/// Runtime options shared by all transport implementations.
-///
-/// `host`/`port` determine the bound listener address, while `transport` picks the
-/// serialization/multiplexing layer.
+/// Runtime options shared by all serve entrypoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeOptions {
-    /// Transport protocol that will expose the child process.
-    pub transport: ServeTransport,
-    /// Listener host or IP address to bind.
-    pub host: String,
-    /// Listener port. `0` lets the OS choose an ephemeral port.
-    pub port: u16,
+    /// Complete serve behavior, including transport selection and bind target.
+    pub mode: ServeMode,
 }
 
 /// Serves an ACP agent via the chosen transport so external clients can interact.
@@ -52,13 +66,11 @@ pub async fn serve_agent(
 
     let prepared = prepare_agent_command(agent, user_args).await?;
 
-    match options.transport {
-        ServeTransport::Http => {
-            h2::serve_h2(prepared, &agent.id, &options.host, options.port).await
-        }
-        ServeTransport::Tcp => {
-            tcp::serve_tcp(prepared, &agent.id, &options.host, options.port).await
-        }
-        ServeTransport::Ws => ws::serve_ws(prepared, &agent.id, &options.host, options.port).await,
+    match options.mode {
+        ServeMode::Http { host, port } => h2::serve_h2(prepared, &agent.id, &host, port).await,
+        ServeMode::Tcp { host, port } => tcp::serve_tcp(prepared, &agent.id, &host, port).await,
+        ServeMode::Ws { host, port } => ws::serve_ws(prepared, &agent.id, &host, port).await,
+        #[cfg(unix)]
+        ServeMode::Uds { .. } => todo!("UDS transport is implemented in a later refactor step"),
     }
 }
