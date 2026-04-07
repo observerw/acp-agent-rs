@@ -91,23 +91,25 @@ pub async fn prepare_binary_target(
             }
 
             if try_exists(&paths.cache_dir).await? {
-                fs::remove_dir_all(&paths.cache_dir)
-                    .await
-                    .with_context(|| {
+                if let Err(remove_error) = fs::remove_dir_all(&paths.cache_dir).await {
+                    cleanup_dir(&staging_dir).await;
+                    return Err(remove_error).with_context(|| {
                         format!(
                             "failed to replace invalid cache directory {}",
                             paths.cache_dir.display()
                         )
-                    })?;
-                fs::rename(&staging_dir, &paths.cache_dir)
-                    .await
-                    .with_context(|| {
+                    });
+                }
+                if let Err(rename_error) = fs::rename(&staging_dir, &paths.cache_dir).await {
+                    cleanup_dir(&staging_dir).await;
+                    return Err(rename_error).with_context(|| {
                         format!(
                             "failed to promote staged cache {} to {}",
                             staging_dir.display(),
                             paths.cache_dir.display()
                         )
-                    })?;
+                    });
+                }
                 if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
                     return Ok(cached);
                 }
@@ -248,21 +250,28 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve_cmd_path(extracted_dir: &Path, cmd: &str) -> PathBuf {
-    let sanitized = cmd.trim_start_matches("./");
+pub(crate) fn resolve_cmd_path(extracted_dir: &Path, cmd: &str) -> Result<PathBuf> {
+    let sanitized = cmd.trim();
     let candidate = PathBuf::from(sanitized);
     if candidate.is_absolute() {
-        return candidate;
+        bail!("binary command path must be relative to the extracted payload: {cmd}");
     }
 
     let mut resolved = extracted_dir.to_path_buf();
     for component in candidate.components() {
         match component {
             Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("binary command path must stay within the extracted payload: {cmd}");
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                bail!("binary command path must be relative to the extracted payload: {cmd}");
+            }
             other => resolved.push(other.as_os_str()),
         }
     }
-    resolved
+
+    Ok(resolved)
 }
 
 pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
@@ -295,7 +304,7 @@ async fn prepare_staging_directory(
         .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
     extract_archive(archive_path, extracted_dir.clone()).await?;
 
-    let executable_path = resolve_cmd_path(&extracted_dir, &target.cmd);
+    let executable_path = resolve_cmd_path(&extracted_dir, &target.cmd)?;
     let file_metadata = fs::metadata(&executable_path).await;
     if file_metadata
         .as_ref()
@@ -335,13 +344,24 @@ async fn validate_cached_binary(
     let metadata_bytes = fs::read(&paths.metadata_path)
         .await
         .with_context(|| format!("failed to read {}", paths.metadata_path.display()))?;
-    let metadata: BinaryCacheMetadata = serde_json::from_slice(&metadata_bytes)
-        .with_context(|| format!("failed to decode {}", paths.metadata_path.display()))?;
+    let metadata: BinaryCacheMetadata = match serde_json::from_slice(&metadata_bytes) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            cleanup_dir(&paths.cache_dir).await;
+            return Ok(None);
+        }
+    };
     if &metadata != expected {
         return Ok(None);
     }
 
-    let executable_path = resolve_cmd_path(&paths.extracted_dir, &metadata.cmd);
+    let executable_path = match resolve_cmd_path(&paths.extracted_dir, &metadata.cmd) {
+        Ok(path) => path,
+        Err(_) => {
+            cleanup_dir(&paths.cache_dir).await;
+            return Ok(None);
+        }
+    };
     let file_metadata = fs::metadata(&executable_path).await;
     if file_metadata
         .as_ref()
@@ -391,8 +411,26 @@ mod tests {
     #[test]
     fn resolves_relative_cmd_paths() {
         let base = Path::new("/tmp/acp-agent");
-        let resolved = resolve_cmd_path(base, "./dist-package/cursor-agent");
+        let resolved = resolve_cmd_path(base, "./dist-package/cursor-agent").unwrap();
         assert_eq!(resolved, base.join("dist-package").join("cursor-agent"));
+    }
+
+    #[test]
+    fn rejects_absolute_cmd_paths() {
+        let base = Path::new("/tmp/acp-agent");
+        let error = resolve_cmd_path(base, "/bin/sh").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("binary command path must be relative")
+        );
+    }
+
+    #[test]
+    fn rejects_parent_dir_cmd_paths() {
+        let base = Path::new("/tmp/acp-agent");
+        let error = resolve_cmd_path(base, "../bin/sh").unwrap_err();
+        assert!(error.to_string().contains("must stay within"));
     }
 
     #[tokio::test]
@@ -460,5 +498,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn corrupted_metadata_is_treated_as_cache_miss_and_removed() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let expected = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/demo.tar.gz",
+            "./bin/demo",
+        );
+
+        fs::create_dir_all(&paths.cache_dir).await.unwrap();
+        fs::write(&paths.metadata_path, b"{not-json").await.unwrap();
+
+        assert!(
+            validate_cached_binary(&paths, &expected)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!try_exists(&paths.cache_dir).await.unwrap());
     }
 }
