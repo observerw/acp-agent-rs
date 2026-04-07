@@ -1,9 +1,10 @@
 //! Runtime helpers that the CLI and transports share when launching ACP agents.
 //!
 //! This module wires together preparation (downloading binaries, building
-//! command specs, tracking temporary extraction directories) with the
+//! command specs, managing persistent cached binary payloads) with the
 //! subprocess primitives and transport implementations that surface an agent's
 //! stdio over different network protocols.
+mod cache;
 /// Shared archive download/extraction helpers for binary distributions.
 pub mod distribution;
 /// Command construction and distribution-resolution helpers.

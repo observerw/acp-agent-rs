@@ -1,64 +1,132 @@
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
+use serde_json::to_vec_pretty;
 use tokio::fs;
-use tokio::task;
 use zip::ZipArchive;
 
-use crate::registry::BinaryTarget;
-
+use crate::registry::{BinaryTarget, Platform, RegistryAgent};
+use crate::runtime::cache::{
+    BinaryCacheMetadata, BinaryCachePaths, EXTRACTED_DIR_NAME, METADATA_FILE_NAME,
+    binary_cache_paths, cache_root_dir, safe_path_component,
+};
 /// Prepared binary distribution ready to run or install.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedBinaryTarget {
     /// Resolved executable path within the extracted payload.
     pub executable_path: PathBuf,
     /// Directory containing the extracted payload.
     pub extracted_dir: PathBuf,
-    /// Temporary directory that owns the extracted payload lifetime.
-    pub temp_dir: tempfile::TempDir,
+    /// Stable cache directory that owns the extracted payload.
+    pub cache_dir: PathBuf,
 }
 
-/// Downloads, extracts, validates, and marks executable the current binary target.
-pub async fn prepare_binary_target(target: &BinaryTarget) -> Result<PreparedBinaryTarget> {
-    let temp_dir = task::spawn_blocking(tempfile::tempdir)
-        .await
-        .context("blocking task failed while creating temporary directory")?
-        .context("failed to create temporary directory")?;
-    let archive_path = download_archive(target, temp_dir.path()).await?;
-    let extracted_dir = temp_dir.path().join("extracted");
-    fs::create_dir_all(&extracted_dir)
-        .await
-        .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
-    extract_archive(archive_path, extracted_dir.clone()).await?;
+/// Ensures the current binary target exists in the stable local cache.
+pub async fn prepare_binary_target(
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &BinaryTarget,
+) -> Result<PreparedBinaryTarget> {
+    let root_dir = cache_root_dir()?;
+    let paths = binary_cache_paths(&root_dir, &agent.id, &agent.version, platform);
+    let expected = BinaryCacheMetadata::new(
+        &agent.id,
+        &agent.version,
+        platform,
+        &target.archive,
+        &target.cmd,
+    );
 
-    let executable_path = resolve_cmd_path(&extracted_dir, &target.cmd);
-    let metadata = fs::metadata(&executable_path).await;
-    if metadata
-        .as_ref()
-        .map(|metadata| !metadata.is_file())
-        .unwrap_or(true)
-    {
-        bail!(
-            "downloaded {}, but could not find \"{}\" at {}",
-            target.archive,
-            target.cmd,
-            executable_path.display()
-        );
+    if let Some(prepared) = validate_cached_binary(&paths, &expected).await? {
+        make_executable(&prepared.executable_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to mark {} executable",
+                    prepared.executable_path.display()
+                )
+            })?;
+        return Ok(prepared);
     }
 
-    make_executable(&executable_path)
+    fs::create_dir_all(&paths.parent_dir)
         .await
-        .with_context(|| format!("failed to mark {} executable", executable_path.display()))?;
+        .with_context(|| format!("failed to create {}", paths.parent_dir.display()))?;
 
-    Ok(PreparedBinaryTarget {
-        executable_path,
-        extracted_dir,
-        temp_dir,
-    })
+    let staging_dir = paths
+        .parent_dir
+        .join(unique_staging_dir_name(&agent.version));
+    fs::create_dir_all(&staging_dir)
+        .await
+        .with_context(|| format!("failed to create {}", staging_dir.display()))?;
+
+    let staged = prepare_staging_directory(&staging_dir, target, &expected).await;
+    match staged {
+        Ok(()) => {}
+        Err(error) => {
+            cleanup_dir(&staging_dir).await;
+            return Err(error);
+        }
+    }
+
+    match fs::rename(&staging_dir, &paths.cache_dir).await {
+        Ok(()) => {
+            if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
+                return Ok(cached);
+            }
+            bail!(
+                "cache directory {} was created, but validation still failed",
+                paths.cache_dir.display()
+            );
+        }
+        Err(rename_error) => {
+            if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
+                cleanup_dir(&staging_dir).await;
+                return Ok(cached);
+            }
+
+            if try_exists(&paths.cache_dir).await? {
+                fs::remove_dir_all(&paths.cache_dir)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to replace invalid cache directory {}",
+                            paths.cache_dir.display()
+                        )
+                    })?;
+                fs::rename(&staging_dir, &paths.cache_dir)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to promote staged cache {} to {}",
+                            staging_dir.display(),
+                            paths.cache_dir.display()
+                        )
+                    })?;
+                if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
+                    return Ok(cached);
+                }
+                bail!(
+                    "cache directory {} was created, but validation still failed",
+                    paths.cache_dir.display()
+                );
+            }
+
+            cleanup_dir(&staging_dir).await;
+            Err(rename_error).with_context(|| {
+                format!(
+                    "failed to promote staged cache {} to {}",
+                    staging_dir.display(),
+                    paths.cache_dir.display()
+                )
+            })
+        }
+    }
 }
 
 pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> Result<PathBuf> {
@@ -93,7 +161,7 @@ pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> 
 }
 
 pub(crate) async fn extract_archive(archive_path: PathBuf, destination: PathBuf) -> Result<()> {
-    task::spawn_blocking(move || extract_archive_blocking(&archive_path, &destination))
+    tokio::task::spawn_blocking(move || extract_archive_blocking(&archive_path, &destination))
         .await
         .context("blocking task failed while extracting archive")?
 }
@@ -213,4 +281,184 @@ pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
     }
 
     Ok(())
+}
+
+async fn prepare_staging_directory(
+    staging_dir: &Path,
+    target: &BinaryTarget,
+    metadata: &BinaryCacheMetadata,
+) -> Result<()> {
+    let archive_path = download_archive(target, staging_dir).await?;
+    let extracted_dir = staging_dir.join(EXTRACTED_DIR_NAME);
+    fs::create_dir_all(&extracted_dir)
+        .await
+        .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
+    extract_archive(archive_path, extracted_dir.clone()).await?;
+
+    let executable_path = resolve_cmd_path(&extracted_dir, &target.cmd);
+    let file_metadata = fs::metadata(&executable_path).await;
+    if file_metadata
+        .as_ref()
+        .map(|metadata| !metadata.is_file())
+        .unwrap_or(true)
+    {
+        bail!(
+            "downloaded {}, but could not find \"{}\" at {}",
+            target.archive,
+            target.cmd,
+            executable_path.display()
+        );
+    }
+
+    make_executable(&executable_path)
+        .await
+        .with_context(|| format!("failed to mark {} executable", executable_path.display()))?;
+
+    let metadata_path = staging_dir.join(METADATA_FILE_NAME);
+    let metadata_bytes =
+        to_vec_pretty(metadata).context("failed to encode cached binary metadata")?;
+    fs::write(&metadata_path, metadata_bytes)
+        .await
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+
+    Ok(())
+}
+
+async fn validate_cached_binary(
+    paths: &BinaryCachePaths,
+    expected: &BinaryCacheMetadata,
+) -> Result<Option<PreparedBinaryTarget>> {
+    if !try_exists(&paths.metadata_path).await? {
+        return Ok(None);
+    }
+
+    let metadata_bytes = fs::read(&paths.metadata_path)
+        .await
+        .with_context(|| format!("failed to read {}", paths.metadata_path.display()))?;
+    let metadata: BinaryCacheMetadata = serde_json::from_slice(&metadata_bytes)
+        .with_context(|| format!("failed to decode {}", paths.metadata_path.display()))?;
+    if &metadata != expected {
+        return Ok(None);
+    }
+
+    let executable_path = resolve_cmd_path(&paths.extracted_dir, &metadata.cmd);
+    let file_metadata = fs::metadata(&executable_path).await;
+    if file_metadata
+        .as_ref()
+        .map(|metadata| !metadata.is_file())
+        .unwrap_or(true)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedBinaryTarget {
+        executable_path,
+        extracted_dir: paths.extracted_dir.clone(),
+        cache_dir: paths.cache_dir.clone(),
+    }))
+}
+
+async fn try_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+async fn cleanup_dir(path: &Path) {
+    let _ = fs::remove_dir_all(path).await;
+}
+
+fn unique_staging_dir_name(agent_version: &str) -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".{}-staging-{pid}-{nanos}",
+        safe_path_component(agent_version)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::cache::BinaryCacheMetadata;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolves_relative_cmd_paths() {
+        let base = Path::new("/tmp/acp-agent");
+        let resolved = resolve_cmd_path(base, "./dist-package/cursor-agent");
+        assert_eq!(resolved, base.join("dist-package").join("cursor-agent"));
+    }
+
+    #[tokio::test]
+    async fn validates_matching_cached_binary() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let metadata = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/demo.tar.gz",
+            "./bin/demo",
+        );
+
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .await
+            .unwrap();
+        let executable_path = paths.extracted_dir.join("bin").join("demo");
+        fs::create_dir_all(executable_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&executable_path, b"#!/bin/sh\n").await.unwrap();
+
+        let prepared = validate_cached_binary(&paths, &metadata).await.unwrap();
+        assert_eq!(
+            prepared.unwrap(),
+            PreparedBinaryTarget {
+                executable_path,
+                extracted_dir: paths.extracted_dir,
+                cache_dir: paths.cache_dir,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_cached_binary_when_metadata_mismatches() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let expected = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/demo.tar.gz",
+            "./bin/demo",
+        );
+        let cached = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/other.tar.gz",
+            "./bin/demo",
+        );
+
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, serde_json::to_vec(&cached).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            validate_cached_binary(&paths, &expected)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

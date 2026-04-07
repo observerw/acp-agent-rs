@@ -16,7 +16,7 @@ Search for agents by ID, name, or description:
 acp-agent search claude
 ```
 
-Install an agent from the registry:
+Prepare an agent for local execution:
 
 ```bash
 acp-agent install example-agent
@@ -33,6 +33,9 @@ Run an agent over stdio and pass through extra arguments after `--`:
 ```bash
 acp-agent run example-agent -- --model gpt-5
 ```
+
+For binary agents, `install` prewarms the local `acp-agent` cache and `run` /
+`serve` reuse that cache automatically.
 
 Expose an agent over a network transport:
 

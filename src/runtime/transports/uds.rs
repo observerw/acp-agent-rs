@@ -44,7 +44,6 @@ pub async fn serve_uds(
     })?;
     eprintln!("Accepted connection on {}", path.display());
 
-    let _temp_dir = prepared.temp_dir;
     serve_uds_connection(prepared.spec, subject, socket).await
 }
 

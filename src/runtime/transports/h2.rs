@@ -63,7 +63,6 @@ async fn serve_h2_connection(
     subject: &str,
     socket: TcpStream,
 ) -> Result<ExitStatus> {
-    let _temp_dir = prepared.temp_dir;
     let mut child = spawn_stream_child(&prepared.spec, subject)?;
     let child_stdin = child
         .stdin
@@ -276,7 +275,6 @@ mod tests {
                 env: Vec::new(),
                 current_dir: None,
             },
-            temp_dir: None,
         }
     }
 

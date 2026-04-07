@@ -10,7 +10,6 @@ pub fn prepared_command(program: &str, args: &[&str]) -> PreparedCommand {
             env: Vec::new(),
             current_dir: None,
         },
-        temp_dir: None,
     }
 }
 

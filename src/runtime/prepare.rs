@@ -26,22 +26,18 @@ pub struct CommandSpec {
 #[derive(Debug)]
 /// The prepared payload returned to transports and runners.
 ///
-/// Consumers should drop this struct only after the agent process exits; the
-/// optional `temp_dir` keeps the temporary extraction directory alive for the
-/// duration of the child process.
+/// For binary distributions the resolved executable lives under a persistent
+/// cache directory that can be reused across invocations.
 pub struct PreparedCommand {
     /// The command specification suitable for `tokio::process::Command`.
     pub spec: CommandSpec,
-    /// Temp directory that must survive while the agent process runs (if present).
-    pub temp_dir: Option<tempfile::TempDir>,
 }
 
 /// Builds a `PreparedCommand` from a registry entry and extra user arguments.
 ///
 /// The runtime first attempts to download and extract a binary distribution for
 /// the current platform, then falls back to `npx` or `uvx` package runners if no
-/// binary target exists. Any resolved temporary directory is returned so callers
-/// can keep it alive while the spawned process runs.
+/// binary target exists.
 pub async fn prepare_agent_command(
     agent: &RegistryAgent,
     user_args: &[String],
@@ -49,7 +45,7 @@ pub async fn prepare_agent_command(
     if let Some(binary) = &agent.distribution.binary {
         let platform = Platform::current()?;
         if let Some(target) = binary.for_platform(platform) {
-            let prepared_binary = prepare_binary_target(target).await?;
+            let prepared_binary = prepare_binary_target(agent, platform, target).await?;
 
             return Ok(PreparedCommand {
                 spec: binary_command_spec(
@@ -58,7 +54,6 @@ pub async fn prepare_agent_command(
                     target,
                     user_args,
                 ),
-                temp_dir: Some(prepared_binary.temp_dir),
             });
         }
     }
@@ -72,7 +67,6 @@ pub async fn prepare_agent_command(
                 npx.env.as_ref(),
                 user_args,
             ),
-            temp_dir: None,
         });
     }
 
@@ -85,7 +79,6 @@ pub async fn prepare_agent_command(
                 uvx.env.as_ref(),
                 user_args,
             ),
-            temp_dir: None,
         });
     }
 

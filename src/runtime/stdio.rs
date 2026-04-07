@@ -9,8 +9,7 @@ use crate::runtime::process::apply_command_spec;
 
 /// Runs an agent with stdio connected directly to the current terminal.
 ///
-/// Keeps the temporary extraction directory alive while the agent process runs so
-/// downloaded binaries do not disappear mid-execution.
+/// Binary payloads are resolved from the persistent local cache when available.
 pub async fn run_agent_stdio(agent_id: &str, user_args: &[String]) -> Result<ExitStatus> {
     let registry = fetch_registry().await?;
     let agent = registry
@@ -18,7 +17,6 @@ pub async fn run_agent_stdio(agent_id: &str, user_args: &[String]) -> Result<Exi
         .with_context(|| format!("failed to resolve agent \"{agent_id}\" from registry"))?;
 
     let prepared = prepare_agent_command(agent, user_args).await?;
-    let _temp_dir = prepared.temp_dir;
     run_command_stdio(prepared.spec, &agent.id).await
 }
 

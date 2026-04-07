@@ -50,7 +50,6 @@ pub async fn serve_ws(
     })?;
     eprintln!("Accepted connection from {}", peer_address);
 
-    let _temp_dir = prepared.temp_dir;
     serve_ws_connection(prepared.spec, subject, socket).await
 }
 
@@ -315,7 +314,6 @@ mod tests {
                 env: Vec::new(),
                 current_dir: None,
             },
-            temp_dir: None,
         }
     }
 

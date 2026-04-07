@@ -1,19 +1,14 @@
 use std::ffi::OsString;
-#[cfg(test)]
-use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::fs;
 use tokio::process::Command;
 
 use crate::registry::{
     BinaryTarget, NpxDistribution, Platform, Registry, RegistryAgent, UvxDistribution,
     fetch_registry,
 };
-#[cfg(test)]
-use crate::runtime::distribution::resolve_cmd_path;
-use crate::runtime::distribution::{make_executable, prepare_binary_target};
+use crate::runtime::distribution::prepare_binary_target;
 
 /// Installs an agent by ID using the configured registry distribution.
 ///
@@ -28,7 +23,7 @@ pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
 
 /// Core installer that inspects each distribution in priority order.
 ///
-/// Binary archives are installed to the user-local bin directory when a
+/// Binary archives are prepared inside the local `acp-agent` cache when a
 /// platform-matching release exists; otherwise the function falls back to npm or
 /// uv package installers depending on what the registry exposes.
 pub async fn install_from_registry(
@@ -93,49 +88,13 @@ async fn install_uvx(
 }
 
 async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<InstallOutcome> {
-    let prepared_binary = prepare_binary_target(target).await?;
-    let source_path = prepared_binary.executable_path;
-    let _temp_dir = prepared_binary.temp_dir;
-
-    let install_dir = user_install_dir()?;
-    fs::create_dir_all(&install_dir)
-        .await
-        .with_context(|| format!("failed to create {}", install_dir.display()))?;
-    let file_name = source_path
-        .file_name()
-        .ok_or_else(|| anyhow!("invalid binary command path: {}", target.cmd))?;
-    let destination = install_dir.join(file_name);
-    fs::copy(&source_path, &destination)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                source_path.display(),
-                destination.display()
-            )
-        })?;
-    make_executable(&destination).await?;
+    let platform = Platform::current()?;
+    let prepared_binary = prepare_binary_target(agent, platform, target).await?;
 
     Ok(InstallOutcome::Binary {
         agent_id: agent.id.clone(),
-        path: destination,
+        cache_dir: prepared_binary.cache_dir,
     })
-}
-
-fn user_install_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("could not determine the current user's home directory"))?;
-        Ok(home.join(".acp-agent").join("bin"))
-    }
-
-    #[cfg(not(windows))]
-    {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow!("could not determine the current user's home directory"))?;
-        Ok(home.join(".local").join("bin"))
-    }
 }
 
 async fn run_command<I, S>(program: &str, args: I, subject: &str) -> Result<()>
@@ -179,12 +138,12 @@ pub enum InstallMethod {
 /// Outcome data that is printed by the `install` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOutcome {
-    /// A binary archive was downloaded and copied under the user bin directory.
+    /// A binary archive was prepared inside the local acp-agent cache.
     Binary {
         /// ID of the agent that was installed.
         agent_id: String,
-        /// Filesystem path of the copied executable.
-        path: PathBuf,
+        /// Filesystem path of the prepared cache directory.
+        cache_dir: PathBuf,
     },
     /// A package manager (npm or uv) installed a wrapper on behalf of the agent.
     PackageManager {
@@ -200,8 +159,11 @@ pub enum InstallOutcome {
 impl std::fmt::Display for InstallOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Binary { agent_id, path } => {
-                write!(f, "Installed {agent_id} to {}", path.display())
+            Self::Binary {
+                agent_id,
+                cache_dir,
+            } => {
+                write!(f, "Prepared {agent_id} in cache: {}", cache_dir.display())
             }
             Self::PackageManager {
                 agent_id,
@@ -243,13 +205,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolves_relative_cmd_paths() {
-        let base = Path::new("/tmp/acp-agent");
-        let resolved = resolve_cmd_path(base, "./dist-package/cursor-agent");
-        assert_eq!(resolved, base.join("dist-package").join("cursor-agent"));
-    }
-
     #[tokio::test]
     async fn reports_missing_distribution() {
         let agent = sample_agent();
@@ -268,6 +223,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "agent \"demo\" does not have an installable distribution"
+        );
+    }
+
+    #[test]
+    fn displays_binary_cache_outcome() {
+        let outcome = InstallOutcome::Binary {
+            agent_id: "demo".to_string(),
+            cache_dir: PathBuf::from("/tmp/acp-agent/demo"),
+        };
+
+        assert_eq!(
+            outcome.to_string(),
+            "Prepared demo in cache: /tmp/acp-agent/demo"
         );
     }
 }

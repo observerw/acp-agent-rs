@@ -139,6 +139,7 @@ enum Commands {
         #[arg(short = 'y', long = "yes")]
         yes: bool,
     },
+    #[command(about = "Prepare an ACP agent for local execution.")]
     Install {
         agent_id: String,
     },
