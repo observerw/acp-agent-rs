@@ -12,6 +12,11 @@ dependencies = [
     "websockets>=16.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
 [build-system]
 requires = ["uv_build>=0.10.7,<0.11.0"]
 build-backend = "uv_build"
