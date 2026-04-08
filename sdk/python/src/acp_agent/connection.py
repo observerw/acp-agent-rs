@@ -13,6 +13,8 @@ import acp
 
 from .transport import ClientTransport
 
+_BRIDGE_STREAM_LIMIT_BYTES = 4 * 1024 * 1024
+
 
 class BridgeProtocolError(ValueError):
     """Raised when the bridge sees invalid NDJSON/JSON-RPC messages."""
@@ -122,8 +124,14 @@ async def _create_stream_pair() -> tuple[
     sock_b.setblocking(False)
 
     try:
-        conn_reader, conn_writer = await asyncio.open_connection(sock=sock_a)
-        bridge_reader, bridge_writer = await asyncio.open_connection(sock=sock_b)
+        conn_reader, conn_writer = await asyncio.open_connection(
+            sock=sock_a,
+            limit=_BRIDGE_STREAM_LIMIT_BYTES,
+        )
+        bridge_reader, bridge_writer = await asyncio.open_connection(
+            sock=sock_b,
+            limit=_BRIDGE_STREAM_LIMIT_BYTES,
+        )
     except Exception:
         sock_a.close()
         sock_b.close()

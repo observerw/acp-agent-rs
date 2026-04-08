@@ -10,6 +10,7 @@ import websockets
 from acp.client.connection import ClientSideConnection
 
 from acp_agent import ReadonlyClient, TransportProtocolError, WebSocketTransport, open_client_connection
+from acp_agent.connection import _close_writer, _create_stream_pair, _pump_connection_to_transport
 
 
 class _IdleTransport:
@@ -172,5 +173,33 @@ def test_open_client_connection_closes_transport_on_exit() -> None:
         async with open_client_connection(client=client, transport=transport) as conn:
             assert isinstance(conn, ClientSideConnection)
         assert transport.closed
+
+    asyncio.run(_scenario())
+
+
+def test_bridge_handles_ndjson_lines_larger_than_default_stream_limit() -> None:
+    async def _scenario() -> None:
+        conn_reader, conn_writer, bridge_reader, bridge_writer = await _create_stream_pair()
+        del conn_reader
+        transport = _IdleTransport()
+        pump_task = asyncio.create_task(_pump_connection_to_transport(bridge_reader, transport))
+
+        large_message = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/update",
+            "params": {"blob": "x" * (70 * 1024)},
+        }
+        conn_writer.write((json.dumps(large_message) + "\n").encode("utf-8"))
+        await conn_writer.drain()
+
+        deadline = asyncio.get_running_loop().time() + 1
+        while not transport.sent_messages and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert transport.sent_messages == [large_message]
+
+        await _close_writer(conn_writer)
+        await asyncio.wait_for(pump_task, timeout=1)
+        await _close_writer(bridge_writer)
 
     asyncio.run(_scenario())
