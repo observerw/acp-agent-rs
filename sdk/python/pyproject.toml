@@ -1,8 +1,7 @@
 [project]
 name = "acp-agent"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Python agent implementation for the Agent Client Protocol."
 authors = [
     { name = "王博伟", email = "wozluohd@gmail.com" }
 ]
