@@ -1,0 +1,17 @@
+[project]
+name = "acp-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "王博伟", email = "wozluohd@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "agent-client-protocol>=0.9.0",
+    "websockets>=16.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
